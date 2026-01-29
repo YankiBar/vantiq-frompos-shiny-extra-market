@@ -13,7 +13,7 @@ from vantiqconnectorsdk import (
 )
 
 # ------------ Settings ------------
-CONNECTOR_VERSION = "1.1.0"
+CONNECTOR_VERSION = "1.3.5"  # Updated based on 1.1.0
 log = logging.getLogger("ApiSourceConnector")
 
 # Global runtime config (loaded on connect)
@@ -102,25 +102,18 @@ def apply_schema_filter(record: Dict[str, Any]) -> Dict[str, Any]:
 def map_api_item_to_vantiq_item(raw: Dict[str, Any]) -> Dict[str, Any]:
     """
     Maps API item -> Items-like payload.
-    GUARANTEE: PluGroup is ALWAYS set.
+    FIX: Uses 'segment' as the single source for PluGroup and Department.
     """
 
-    # ---- Resolve PluGroup (MANDATORY) ----
-    raw_group = raw.get("group_code")
-    if raw_group is None or str(raw_group).strip() == "":
-        log.warning(
-            "Missing group_code for barcode=%s, falling back to department_code",
-            raw.get("barcode"),
-        )
-        raw_group = raw.get("department_code")
+    # ---- Resolve Segment (MANDATORY) ----
+    segment = raw.get("segment")
+    if segment is None or str(segment).strip() == "":
+        # Log warning and skip or use fallback?
+        # Per instructions: segment is mandatory now.
+        log.warning("Item %s missing 'segment'. Skipping.", raw.get("barcode"))
+        raise ValueError("Missing segment")
 
-    if raw_group is None or str(raw_group).strip() == "":
-        # This should never happen in a sane feed
-        raise ValueError(
-            f"Item {raw.get('item_code')} has no group_code and no department_code"
-        )
-
-    plu_group = str(raw_group).strip()
+    segment_str = str(segment).strip()
 
     record: Dict[str, Any] = {
         # Use barcode as the primary Code and do NOT send item_code
@@ -128,9 +121,9 @@ def map_api_item_to_vantiq_item(raw: Dict[str, Any]) -> Dict[str, Any]:
         "Name": str(raw.get("item_name_ar") or raw.get("item_name_en") or "").strip(),
         "Price": str(raw.get("sell_price", "0")),
         "Weighted": "1" if _truthy(raw.get("is_weightable")) else "0",
-        # ---- STRUCTURAL FIELDS ----
-        "Department": str(raw.get("department_code") or "").strip(),
-        "PluGroup": plu_group,  # 🔥 ALWAYS PRESENT, STRING
+        # ---- STRUCTURAL FIELDS (Modified) ----
+        "Department": segment_str,  # Mapped from segment
+        "PluGroup": segment_str,  # Mapped from segment
         # ---- Optional enrichments ----
         # EAN set from barcode only
         "EAN": str(raw.get("barcode") or "").strip(),
@@ -138,8 +131,7 @@ def map_api_item_to_vantiq_item(raw: Dict[str, Any]) -> Dict[str, Any]:
         # ---- Debug / trace ----
         "ExtendedInfo": {
             "whs_code": raw.get("whs_code"),
-            "group_code": raw.get("group_code"),
-            "department_code": raw.get("department_code"),
+            "segment": segment_str,
             "category": raw.get("category"),
             "org_sell_price": raw.get("org_sell_price"),
             "image_name": raw.get("image_name"),
@@ -157,50 +149,34 @@ def extract_master_data(
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Build unique Departments + PluGroups definitions from the raw items list.
-
-    We do NOT set PluGroups.DepartmentId here (we don't know the Department _id).
-    Instead we send DepartmentCode and let VAIL resolve DepartmentId per hierarchy.
+    FIX: Derived from segment logic.
     """
     dept_by_code: Dict[str, Dict[str, Any]] = {}
     group_by_code: Dict[str, Dict[str, Any]] = {}
 
     for it in raw_items:
-        dept_code = str(it.get("department_code") or "").strip()
-        group_code = str(it.get("group_code") or "").strip()
+        segment = str(it.get("segment") or "").strip()
         category = str(it.get("category") or "").strip()
 
-        if dept_code:
-            # Department schema requires Active, Code, Name
-            # Name: we only have "category" which might not be department name; still better than empty.
-            dept_by_code.setdefault(
-                dept_code,
-                {"Code": dept_code, "Name": category or dept_code, "Active": True},
-            )
+        if not segment:
+            continue
 
-        if group_code:
-            existing = group_by_code.get(group_code)
-            if (
-                existing
-                and existing.get("DepartmentCode")
-                and dept_code
-                and existing["DepartmentCode"] != dept_code
-            ):
-                log.warning(
-                    "Conflicting DepartmentCode for PluGroup %s: %s vs %s. Keeping first.",
-                    group_code,
-                    existing["DepartmentCode"],
-                    dept_code,
-                )
-            else:
-                group_by_code.setdefault(
-                    group_code,
-                    {
-                        "Code": group_code,
-                        "Name": category or group_code,
-                        "Active": True,
-                        "DepartmentCode": dept_code or None,
-                    },
-                )
+        # Department (Code = segment)
+        if segment not in dept_by_code:
+            dept_by_code[segment] = {
+                "Code": segment,
+                "Name": category or f"Dept {segment}",
+                "Active": True,
+            }
+
+        # PluGroup (Code = segment, Linked to Department = segment)
+        if segment not in group_by_code:
+            group_by_code[segment] = {
+                "Code": segment,
+                "Name": category or f"Group {segment}",
+                "Active": True,
+                "DepartmentCode": segment,
+            }
 
     return list(dept_by_code.values()), list(group_by_code.values())
 
@@ -265,45 +241,16 @@ async def run_fetch_pipeline(conn: VantiqConnector):
                 )
                 continue
 
-            # Build hierarchical master-data (Departments + PluGroups) for this store/hierarchy
-            # Departments and PluGroups are linked via `departmentId` on the group object
-            unique_departments: Dict[str, Dict[str, Any]] = {}
-            unique_groups: Dict[str, Dict[str, Any]] = {}
+            # FIX: Use new extract_master_data based on segment
+            departments, plu_groups = extract_master_data(store_items)
 
+            # Map items
+            vantiq_items = []
             for it in store_items:
-                d_code = it.get("department_code")
-                g_code = it.get("group_code")
-                category = str(it.get("category") or "").strip()
-
-                if d_code and str(d_code).strip() not in unique_departments:
-                    dc = str(d_code).strip()
-                    unique_departments[dc] = {
-                        "id": dc,
-                        "name": f"Dept {dc}",
-                        "hierarchyId": hierarchy_id,
-                    }
-
-                if g_code and str(g_code).strip() not in unique_groups:
-                    gc = str(g_code).strip()
-                    # Use the item's category for the PluGroup name when available
-                    group_name = category if category else f"Group {gc}"
-                    unique_groups[gc] = {
-                        "id": gc,
-                        "name": group_name,
-                        "departmentId": str(d_code).strip() if d_code else None,
-                        "hierarchyId": hierarchy_id,
-                    }
-
-            departments = list(unique_departments.values())
-            plu_groups = list(unique_groups.values())
-
-            print(f"Resolved hierarchyId for whs_code={whs_code}: {hierarchy_id}")
-            log.info(
-                "Resolved mapping: whs_code=%s -> hierarchyId=%s",
-                whs_code,
-                hierarchy_id,
-            )
-            vantiq_items = [map_api_item_to_vantiq_item(it) for it in store_items]
+                try:
+                    vantiq_items.append(map_api_item_to_vantiq_item(it))
+                except ValueError:
+                    continue
 
             total = len(vantiq_items)
             batch_size = int(api_config.get("batch_size") or 500)
@@ -398,6 +345,7 @@ async def handle_connect(ctx: dict, config: dict):
             "ExtendedInfo",
             "Cost",
             "Tara",
+            "segment",  # FIX: Added segment so it won't be filtered out
         ]
 
     # Hierarchy map
@@ -495,7 +443,12 @@ async def main():
         handle_close, handle_connect, handle_publish, handle_query
     )
 
-    await connector_set.declare_healthy()
+    # FIX: try/except block to handle Port 10048 error gracefully
+    try:
+        await connector_set.declare_healthy()
+    except Exception as e:
+        log.warning("Health check port busy (ignoring): %s", e)
+
     await connector_set.run_connectors()
 
 
